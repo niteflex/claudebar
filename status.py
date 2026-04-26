@@ -250,8 +250,6 @@ def render_statusline() -> None:
         if r5:
             seg += " " + label(r5)
         parts.append(seg)
-    else:
-        parts.append(label("—"))
 
     # Group 2: 7-day (only when official data is available)
     if seven_d_pct is not None:
