@@ -7,7 +7,7 @@ Modes:
   --update       refresh JSONL-based cache only, no output (background job)
 """
 
-import json, os, sys, subprocess, time
+import json, os, sys, time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -16,7 +16,8 @@ CLAUDE_DIR    = Path.home() / ".claude"
 PROJECTS_DIR  = CLAUDE_DIR / "projects"
 SETTINGS      = CLAUDE_DIR / "settings.json"
 CACHE         = Path("/tmp/.cc_status_cache.json")
-CACHE_TTL_ZSH = 60
+CACHE_TTL_ZSH  = 60
+CACHE_TTL_SHOW = 600  # hide RPROMPT 10 min after last Claude response
 
 BLOCK_H   = 5
 CTX_LIMIT = 200_000
@@ -98,14 +99,9 @@ def folder(path: str) -> str:
 
 # ── Process checks ────────────────────────────────────────────────────────────
 def is_claude_active() -> bool:
-    try:
-        r = subprocess.run(["pgrep", "-x", "claude"], capture_output=True)
-        if r.returncode == 0:
-            return True
-    except Exception:
-        pass
     c = load_cache()
-    return bool(c and c.get("source") == "stdin" and (time.time() - c.get("ts", 0)) < 300)
+    return bool(c and c.get("source") == "stdin"
+                and (time.time() - c.get("ts", 0)) < CACHE_TTL_SHOW)
 
 # ── Cache ─────────────────────────────────────────────────────────────────────
 def load_cache() -> dict:
