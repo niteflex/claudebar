@@ -97,11 +97,18 @@ def folder(path: str) -> str:
         return "~"
     return Path(path.rstrip("/")).name or "~"
 
-# ── Process checks ────────────────────────────────────────────────────────────
+# ── Active check ──────────────────────────────────────────────────────────────
 def is_claude_active() -> bool:
     c = load_cache()
-    return bool(c and c.get("source") == "stdin"
-                and (time.time() - c.get("ts", 0)) < CACHE_TTL_SHOW)
+    if not c or c.get("source") != "stdin":
+        return False
+    if (time.time() - c.get("ts", 0)) >= CACHE_TTL_SHOW:
+        return False
+    saved_sid = c.get("session_id", "")
+    current_sid = os.environ.get("CC_SESSION_ID", "")
+    if saved_sid and current_sid and saved_sid != current_sid:
+        return False  # different shell session — don't show
+    return True
 
 # ── Cache ─────────────────────────────────────────────────────────────────────
 def load_cache() -> dict:
@@ -229,6 +236,7 @@ def render_statusline() -> None:
         "cost_usd":      cost_usd,
         "model":         model_name,
         "source":        "stdin",
+        "session_id":    os.environ.get("CC_SESSION_ID", ""),
         "ts":            now,
     })
 
