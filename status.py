@@ -104,10 +104,9 @@ def is_claude_active() -> bool:
         return False
     if (time.time() - c.get("ts", 0)) >= CACHE_TTL_SHOW:
         return False
-    saved_sid = c.get("session_id", "")
     current_sid = os.environ.get("CC_SESSION_ID", "")
-    if saved_sid and current_sid and saved_sid != current_sid:
-        return False  # different shell session — don't show
+    if current_sid and c.get("session_id", "") != current_sid:
+        return False  # this terminal has an ID that doesn't match the cached session
     return True
 
 # ── Cache ─────────────────────────────────────────────────────────────────────
