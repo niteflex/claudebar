@@ -30,17 +30,22 @@ MODEL_SHORT = {
 }
 
 # ── Color palette: monochrome + alert ────────────────────────────────────────
-# Everything is gray by default. Color only appears when approaching limits.
-_GRAY   = "38;5;242"   # normal values
-_AMBER  = "38;5;215"   # warning ≥70%
-_CORAL  = "38;5;203"   # critical ≥90%
-_LABEL  = "38;5;244"   # dim labels, separators — readable on both dark/light bg
-_EMPTY  = "38;5;239"   # empty bar blocks — visible on black terminals
+_GRAY  = "38;5;242"   # normal values
+_GREEN = "38;5;114"   # context healthy (< 60%)
+_AMBER = "38;5;215"   # warning
+_CORAL = "38;5;203"   # critical
+_LABEL = "38;5;244"   # dim labels, separators — readable on both dark/light bg
+_EMPTY = "38;5;239"   # empty bar blocks — visible on black terminals
 
 RST = "\033[0m"
 
 def _code(pct: float) -> str:
-    return _CORAL if pct >= 90 else _AMBER if pct >= 70 else _GRAY
+    """Rate limits: green <60%, amber 60-80%, coral ≥80%."""
+    return _CORAL if pct >= 80 else _AMBER if pct >= 60 else _GREEN
+
+def _ctx_code(pct: float) -> str:
+    """Context window: green <60%, amber 60-80%, coral ≥80%."""
+    return _CORAL if pct >= 80 else _AMBER if pct >= 60 else _GREEN
 
 def _a(code: str, t: str) -> str:
     return f"\033[{code}m{t}{RST}"
@@ -65,6 +70,9 @@ def _zc(code: str, t: str) -> str:
 def zmono(t: str, pct: float) -> str:
     return _zc(_code(pct), t)
 
+def zctx(t: str, pct: float) -> str:
+    return _zc(_ctx_code(pct), t)
+
 def zlabel(t: str) -> str:
     return _zc(_LABEL, t)
 
@@ -75,15 +83,17 @@ def zmono_bar(pct: float, w: int = 8) -> str:
     return filled + empty
 
 # ── Formatting ────────────────────────────────────────────────────────────────
-def fmt_dur(secs: float) -> str:
-    s = int(secs)
-    if s <= 0:   return "now"
-    h, r = divmod(s, 3600)
-    m = r // 60
-    if h >= 48:  return f"{h // 24}d"
-    if h >= 24:  return f"{h // 24}d{h % 24}h"
-    if h  >  0:  return f"{h}h{m:02d}m"
-    return f"{m}m"
+def fmt_reset(ts: float, full: bool = False) -> str:
+    """Format reset timestamp as local time.
+    full=False (5h): '14:30'
+    full=True  (7d): 'Apr 30 07:11'
+    """
+    if ts - time.time() <= 0:
+        return "now"
+    dt = datetime.fromtimestamp(ts)
+    if full:
+        return dt.strftime("%b %-d %H:%M")  # Apr 30 07:11
+    return dt.strftime("%H:%M")             # 14:30
 
 def fmt_tok(n: int) -> str:
     if n >= 1_000_000: return f"{n / 1_000_000:.1f}M"
@@ -91,11 +101,10 @@ def fmt_tok(n: int) -> str:
     return str(n)
 
 def folder(path: str) -> str:
-    """Return just the last path segment (project folder name)."""
     home = str(Path.home())
     if path == home or path == home + "/":
         return "~"
-    return Path(path.rstrip("/")).name or "~"
+    return "~/" + (Path(path.rstrip("/")).name or "~")
 
 # ── Active check ──────────────────────────────────────────────────────────────
 def is_claude_active() -> bool:
@@ -243,30 +252,28 @@ def render_statusline() -> None:
     SPACE = "  "
     parts: list[str] = []
 
-    # Group 1: 5h rate limit — most actionable constraint
+    # Group 1: 5h rate limit — always show reset clock time
     if five_h_pct is not None:
-        r5  = fmt_dur(five_h_rst - now) if five_h_rst else ""
         seg = mono_bar(five_h_pct) + " " + mono(f"{int(five_h_pct)}%", five_h_pct)
-        if r5:
-            seg += " " + label(r5)
+        if five_h_rst:
+            seg += " " + label("↻" + fmt_reset(five_h_rst))
         parts.append(seg)
 
-    # Group 2: 7-day (only when official data is available)
+    # Group 2: 7-day — date if >24h away, clock time if ≤24h
     if seven_d_pct is not None:
-        r7  = fmt_dur(seven_d_rst - now) if seven_d_rst else ""
         seg = label("7d ") + mono(f"{int(seven_d_pct)}%", seven_d_pct)
-        if r7:
-            seg += " " + label(r7)
+        if seven_d_rst:
+            seg += " " + label("↻" + fmt_reset(seven_d_rst, full=True))
         parts.append(seg)
 
-    # Group 3: ctx — current conversation state
+    # Group 3: ctx — color: green <60%, amber 60-80%, coral ≥80%
     if ctx_pct > 2:
-        parts.append(label("ctx ") + mono(f"{int(ctx_pct)}%", ctx_pct))
+        parts.append(label("ctx ") + _a(_ctx_code(ctx_pct), f"{int(ctx_pct)}%"))
 
-    # Group 4: cost (only when meaningful) + model + folder
+    # Group 4: cost (≈ prefix signals API-equivalent, not real spend) + model + folder
     tail = ""
     if cost_usd >= 0.01:
-        tail = mono(f"${cost_usd:.2f}", min(cost_usd * 4, 100)) + SPACE
+        tail = label(f"≈${cost_usd:.2f}") + SPACE
     tail += label(model_name) + SPACE + label(folder(cwd))
     parts.append(tail)
 
@@ -301,31 +308,29 @@ def render_zsh() -> None:
     SPACE = "  "
     parts: list[str] = []
 
-    # 5h block — most actionable
+    # 5h — always clock time
     if five_h_pct is not None:
-        r5  = fmt_dur(five_h_rst - now) if five_h_rst else ""
         seg = zmono_bar(five_h_pct) + " " + zmono(f"{int(five_h_pct)}%%", five_h_pct)
-        if r5:
-            seg += " " + zlabel(r5)
+        if five_h_rst:
+            seg += " " + zlabel("↻" + fmt_reset(five_h_rst))
         parts.append(seg)
 
-    # 7d
+    # 7d — date if >24h, clock time if ≤24h
     if seven_d_pct is not None:
-        r7  = fmt_dur(seven_d_rst - now) if seven_d_rst else ""
         seg = zlabel("7d ") + zmono(f"{int(seven_d_pct)}%%", seven_d_pct)
-        if r7:
-            seg += " " + zlabel(r7)
+        if seven_d_rst:
+            seg += " " + zlabel("↻" + fmt_reset(seven_d_rst, full=True))
         parts.append(seg)
 
-    # ctx
+    # ctx — green <60%, amber 60-80%, coral ≥80%
     ctx_pct_c = c.get("ctx_pct") if c else None
     if ctx_pct_c and ctx_pct_c > 2:
-        parts.append(zlabel("ctx ") + zmono(f"{int(ctx_pct_c)}%%", ctx_pct_c))
+        parts.append(zlabel("ctx ") + zctx(f"{int(ctx_pct_c)}%%", ctx_pct_c))
 
-    # cost + model
+    # cost (≈ = API-equivalent, not real spend) + model
     tail = ""
     if cost_usd and cost_usd >= 0.01:
-        tail = zmono(f"${cost_usd:.2f}", min(cost_usd * 4, 100)) + SPACE
+        tail = zlabel(f"≈${cost_usd:.2f}") + SPACE
     tail += zlabel(model_name)
     parts.append(tail)
 
