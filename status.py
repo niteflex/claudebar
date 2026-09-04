@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""cc-status: Claude Code usage & context monitor.
+"""claudebar: Claude Code usage & context monitor.
 
 Modes:
   --statusline   reads JSON from Claude Code stdin → formatted output
   --zsh          reads cache (populated by statusLine) → zsh RPROMPT string
+  --bar          same bar in plain ANSI, for PowerShell / non-zsh prompts
+  --cost         per-model $ breakdown for the current session (manual, on-demand)
   --update       refresh JSONL-based cache only, no output (background job)
 """
 
@@ -16,17 +18,45 @@ CLAUDE_DIR    = Path.home() / ".claude"
 PROJECTS_DIR  = CLAUDE_DIR / "projects"
 SETTINGS      = CLAUDE_DIR / "settings.json"
 CACHE         = Path("/tmp/.cc_status_cache.json")
-CACHE_TTL_ZSH  = 60
 CACHE_TTL_SHOW = 600  # hide RPROMPT 10 min after last Claude response
+CACHE_TTL_COST = 1800 # --cost accepts a stdin cache up to 30 min old
 
 BLOCK_H   = 5
 CTX_LIMIT = 200_000
 
 MODEL_SHORT = {
-    "sonnet": "sonnet", "claude-sonnet-4-6": "sonnet",
-    "haiku":  "haiku",  "claude-haiku-4-5-20251001": "haiku",
-    "opus":   "opus",   "claude-opus-4-7": "opus",
+    # short aliases (may appear in ~/.claude/settings.json's "model" field)
+    "sonnet": "sonnet",
+    "opus":   "opus",
+    "haiku":  "haiku",
+    "fable":  "fable",
     "default": "?",
+    # current model ids
+    "claude-sonnet-5":            "sonnet",
+    "claude-opus-5":              "opus",
+    "claude-haiku-4-5":           "haiku",
+    "claude-haiku-4-5-20251001":  "haiku",
+    "claude-fable-5-1":           "fable",
+    "claude-fable-5":             "fable",
+    # retired ids — kept so old sessions still resolve to a short label
+    "claude-sonnet-4-6": "sonnet",
+    "claude-opus-4-6":   "opus",
+    "claude-opus-4-7":   "opus",
+    "claude-opus-4-8":   "opus",
+}
+
+# $ per MILLION tokens: (input, output, cache_write_5m, cache_read).
+# The 1h cache-write tier costs 2x the 5m tier system-wide (applied below).
+# Source: https://claude.com/pricing — verified 2026-09-04. Anthropic changes
+# these; if a total looks off, check the live page before trusting this table.
+PRICING = {
+    "claude-haiku-4-5":           (1.00,  5.00,  1.25, 0.10),
+    "claude-haiku-4-5-20251001":  (1.00,  5.00,  1.25, 0.10),
+    "claude-sonnet-5":            (2.00, 10.00,  2.50, 0.20),
+    "claude-opus-5":              (5.00, 25.00,  6.25, 0.50),
+    "claude-fable-5-1":           (10.00, 50.00, 12.50, 0.25),
+    # Fable 5's cache-read rate is unconfirmed — reuses Fable 5.1's as best effort.
+    "claude-fable-5":             (10.00, 50.00, 12.50, 0.25),
 }
 
 # ── Color palette: monochrome + alert ────────────────────────────────────────
@@ -53,6 +83,9 @@ def _a(code: str, t: str) -> str:
 # statusLine helpers (raw ANSI, single %)
 def mono(t: str, pct: float) -> str:
     return _a(_code(pct), t)
+
+def ctxmono(t: str, pct: float) -> str:
+    return _a(_ctx_code(pct), t)
 
 def label(t: str) -> str:
     return _a(_LABEL, t)
@@ -245,6 +278,7 @@ def render_statusline() -> None:
         "model":         model_name,
         "source":        "stdin",
         "session_id":    os.environ.get("CC_SESSION_ID", ""),
+        "transcript_path": d.get("transcript_path"),
         "ts":            now,
     })
 
@@ -279,62 +313,168 @@ def render_statusline() -> None:
 
     print("☁  " + DOT.join(parts), end="")
 
-# ── Render: zsh RPROMPT ───────────────────────────────────────────────────────
-# Layout B compact: ██████░░ 68%  1h12m  ·  7d 31%  3d  ·  ×4  sonnet
-def render_zsh() -> None:
+# ── Render: prompt bar (zsh RPROMPT / PowerShell prompt) ─────────────────────
+# Layout B compact: ██████░░ 68% ↻14:30  ·  7d 31% ↻Apr 30 07:11  ·  ctx 42%  ·  ≈$4.52  sonnet
+def render_bar(zsh: bool = True) -> None:
     if not is_claude_active():
         return
 
-    c   = load_cache()
-    now = time.time()
+    # is_claude_active() already guarantees a stdin-sourced cache newer than
+    # CACHE_TTL_SHOW, so trust it directly — a second, tighter freshness check
+    # here used to fall through to collect_jsonl()'s heuristic (and its full
+    # rglob over ~/.claude/projects) on every prompt redraw between 5 and 10
+    # minutes after Claude's last response.
+    c = load_cache()
 
-    if c and c.get("source") == "stdin" and (now - c.get("ts", 0)) < 300:
-        five_h_pct  = c.get("five_h_pct")
-        five_h_rst  = c.get("five_h_reset")
-        seven_d_pct = c.get("seven_d_pct")
-        seven_d_rst = c.get("seven_d_reset")
-        cost_usd    = c.get("cost_usd", 0)
-        model_name  = c.get("model") or settings_model()
+    five_h_pct  = c.get("five_h_pct")
+    five_h_rst  = c.get("five_h_reset")
+    seven_d_pct = c.get("seven_d_pct")
+    seven_d_rst = c.get("seven_d_reset")
+    cost_usd    = c.get("cost_usd", 0)
+    model_name  = c.get("model") or settings_model()
+
+    # zsh needs %{...%} zero-width wrappers and %% for a literal percent; every
+    # other shell (PowerShell) wants plain ANSI and a bare %.
+    if zsh:
+        col, ctxcol, bar, lab, PCT = zmono, zctx, zmono_bar, zlabel, "%%"
     else:
-        jd = collect_jsonl() if not c or (now - c.get("ts", 0)) > CACHE_TTL_ZSH else c
-        five_h_pct  = jd.get("five_h_pct")
-        five_h_rst  = jd.get("five_h_reset")
-        seven_d_pct = jd.get("seven_d_pct")
-        seven_d_rst = jd.get("seven_d_reset")
-        cost_usd    = jd.get("cost_usd", 0)
-        model_name  = jd.get("model") or settings_model()
+        col, ctxcol, bar, lab, PCT = mono, ctxmono, mono_bar, label, "%"
 
-    DOT   = zlabel("  ·  ")
+    DOT   = lab("  ·  ")
     SPACE = "  "
     parts: list[str] = []
 
     # 5h — always clock time
     if five_h_pct is not None:
-        seg = zmono_bar(five_h_pct) + " " + zmono(f"{int(five_h_pct)}%%", five_h_pct)
+        seg = bar(five_h_pct) + " " + col(f"{int(five_h_pct)}{PCT}", five_h_pct)
         if five_h_rst:
-            seg += " " + zlabel("↻" + fmt_reset(five_h_rst))
+            seg += " " + lab("↻" + fmt_reset(five_h_rst))
         parts.append(seg)
 
     # 7d — date if >24h, clock time if ≤24h
     if seven_d_pct is not None:
-        seg = zlabel("7d ") + zmono(f"{int(seven_d_pct)}%%", seven_d_pct)
+        seg = lab("7d ") + col(f"{int(seven_d_pct)}{PCT}", seven_d_pct)
         if seven_d_rst:
-            seg += " " + zlabel("↻" + fmt_reset(seven_d_rst, full=True))
+            seg += " " + lab("↻" + fmt_reset(seven_d_rst, full=True))
         parts.append(seg)
 
     # ctx — green <60%, amber 60-80%, coral ≥80%
-    ctx_pct_c = c.get("ctx_pct") if c else None
+    ctx_pct_c = c.get("ctx_pct")
     if ctx_pct_c and ctx_pct_c > 2:
-        parts.append(zlabel("ctx ") + zctx(f"{int(ctx_pct_c)}%%", ctx_pct_c))
+        parts.append(lab("ctx ") + ctxcol(f"{int(ctx_pct_c)}{PCT}", ctx_pct_c))
 
     # cost (≈ = API-equivalent, not real spend) + model
     tail = ""
     if cost_usd and cost_usd >= 0.01:
-        tail = zlabel(f"≈${cost_usd:.2f}") + SPACE
-    tail += zlabel(model_name)
+        tail = lab(f"≈${cost_usd:.2f}") + SPACE
+    tail += lab(model_name)
     parts.append(tail)
 
     print("☁ " + DOT.join(parts), end="")
+
+# ── Render: --cost (manual, on-demand per-model breakdown) ────────────────────
+def _tally_transcript(path: Path) -> dict[str, dict[str, int]]:
+    """Sum token usage per model id across one session transcript."""
+    per_model: dict[str, dict[str, int]] = {}
+    with open(path, errors="ignore") as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw or '"assistant"' not in raw:
+                continue
+            try:
+                e = json.loads(raw)
+            except Exception:
+                continue
+            if e.get("type") != "assistant":
+                continue
+            msg   = e.get("message") or {}
+            usage = msg.get("usage")
+            if not usage:
+                continue
+            mid = msg.get("model") or "?"
+            t = per_model.setdefault(
+                mid, {"input": 0, "output": 0, "cw5m": 0, "cw1h": 0, "read": 0})
+
+            # Prefer the explicit 5m/1h split when the entry carries it; the flat
+            # cache_creation_input_tokens field merges both tiers, so falling back
+            # to it slightly undercounts when 1h caching was used (1h costs 2x).
+            cc = usage.get("cache_creation")
+            if isinstance(cc, dict):
+                t["cw5m"] += cc.get("ephemeral_5m_input_tokens", 0) or 0
+                t["cw1h"] += cc.get("ephemeral_1h_input_tokens", 0) or 0
+            else:
+                t["cw5m"] += usage.get("cache_creation_input_tokens", 0) or 0
+
+            t["input"]  += usage.get("input_tokens", 0) or 0
+            t["output"] += usage.get("output_tokens", 0) or 0
+            t["read"]   += usage.get("cache_read_input_tokens", 0) or 0
+    return per_model
+
+def render_cost() -> None:
+    c = load_cache()
+    fresh = (c.get("source") == "stdin"
+             and (time.time() - c.get("ts", 0)) < CACHE_TTL_COST)
+    tpath = c.get("transcript_path") if fresh else None
+    if not tpath or not Path(tpath).is_file():
+        print("No active Claude Code session detected — run this from a terminal "
+              "where Claude Code is running, after at least one response.")
+        return
+
+    per_model = _tally_transcript(Path(tpath))
+    if not per_model:
+        print(f"No assistant messages with usage data found in {tpath}")
+        return
+
+    rows, total, unpriced_tokens = [], 0.0, 0
+    for mid, t in sorted(per_model.items()):
+        price = PRICING.get(mid)
+        tok_total = t["input"] + t["output"] + t["cw5m"] + t["cw1h"] + t["read"]
+        if price:
+            pin, pout, pcw, pread = price
+            usd = (t["input"] * pin
+                   + t["output"] * pout
+                   + t["cw5m"] * pcw
+                   + t["cw1h"] * pcw * 2   # 1h cache-write tier costs 2x the 5m tier
+                   + t["read"] * pread) / 1_000_000
+            total += usd
+            cost_s = f"${usd:.4f}"
+        else:
+            unpriced_tokens += tok_total
+            cost_s = "?"
+        rows.append((MODEL_SHORT.get(mid, mid)[:13], t, cost_s))
+
+    W = (14, 12, 12, 14, 14, 12)
+    head = ("model", "input", "output", "cache write", "cache read", "cost")
+    print(label("claudebar — session cost breakdown"))
+    print(label(tpath))
+    print()
+    print(label(f"{head[0]:<{W[0]}}{head[1]:>{W[1]}}{head[2]:>{W[2]}}"
+                f"{head[3]:>{W[3]}}{head[4]:>{W[4]}}{head[5]:>{W[5]}}"))
+    print(label("─" * sum(W)))
+    for name, t, cost_s in rows:
+        cw = t["cw5m"] + t["cw1h"]
+        print(f"{name:<{W[0]}}{t['input']:>{W[1]},}{t['output']:>{W[2]},}"
+              f"{cw:>{W[3]},}{t['read']:>{W[4]},}{cost_s:>{W[5]}}")
+    print(label("─" * sum(W)))
+    agg = {k: sum(t[k] for _, t, _ in rows)
+           for k in ("input", "output", "cw5m", "cw1h", "read")}
+    print(f"{'total':<{W[0]}}{agg['input']:>{W[1]},}{agg['output']:>{W[2]},}"
+          f"{agg['cw5m'] + agg['cw1h']:>{W[3]},}{agg['read']:>{W[4]},}"
+          f"{'$' + format(total, '.4f'):>{W[5]}}")
+    print()
+    cc_est = c.get("cost_usd")
+    if cc_est is not None:
+        print(f"Claude Code's own estimate:           ${float(cc_est):.2f}")
+    print(f"claudebar per-model breakdown total:  ${total:.2f}")
+    print(label("The two are computed independently and may differ; neither is "
+                "authoritative billing."))
+    if unpriced_tokens:
+        print(label(f"{unpriced_tokens:,} tokens belong to models missing from the "
+                    "pricing table and are excluded from the total."))
+    subs = Path(tpath).with_suffix("") / "subagents"
+    if subs.is_dir():
+        print(label("Subagent transcripts exist for this session and are not "
+                    "included — this covers the main conversation only."))
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main() -> None:
@@ -343,8 +483,12 @@ def main() -> None:
         save_cache(collect_jsonl())
     elif mode == "--statusline":
         render_statusline()
+    elif mode == "--cost":
+        render_cost()
+    elif mode == "--bar":
+        render_bar(zsh=False)   # plain ANSI — PowerShell and other non-zsh prompts
     else:
-        render_zsh()
+        render_bar(zsh=True)
 
 if __name__ == "__main__":
     main()
