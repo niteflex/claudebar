@@ -61,7 +61,7 @@ PRICING = {
 
 # ── Color palette: monochrome + alert ────────────────────────────────────────
 _GRAY  = "38;5;242"   # normal values
-_GREEN = "38;5;114"   # context healthy (< 60%)
+_GREEN = "38;5;114"   # healthy
 _AMBER = "38;5;215"   # warning
 _CORAL = "38;5;203"   # critical
 _LABEL = "38;5;244"   # dim labels, separators — readable on both dark/light bg
@@ -69,24 +69,23 @@ _EMPTY = "38;5;239"   # empty bar blocks — visible on black terminals
 
 RST = "\033[0m"
 
-# Context colour is driven by an ABSOLUTE token count, not % of the model's
-# context window. Anthropic publishes no quality-vs-context-fill threshold, and
-# auto-compact now fires only near the top of whatever window the model has
-# (~200K for 200K models, ~967K for 1M models) — so a window-relative % goes
-# red 5x later on a 1M model for the same real amount of context. These fixed
-# breakpoints (the old 60% / 80% of a 200K window) keep the colour meaning the
-# same regardless of which model is active. Change with care.
-CTX_AMBER_TOKENS = 120_000
-CTX_CORAL_TOKENS = 160_000
+# Context colour tracks how full the ACTIVE model's real context window is.
+# Claude Code reports that window live in the stdin JSON (context_window.
+# used_percentage / context_window_size) — 200K, 1M, whatever the current model
+# actually has — so this adapts per model with no hardcoded ceiling. Auto-compact
+# fires near the top of that window (~97-100%), so coral means "compaction is
+# close, wrap up or /clear on your own terms". Tune the two cutoffs to taste.
+CTX_AMBER_PCT = 70   # amber at 70% of the model's context window
+CTX_CORAL_PCT = 85   # coral at 85% — a margin before auto-compact
 
 def _code(pct: float) -> str:
     """Rate limits: green <60%, amber 60-80%, coral ≥80%."""
     return _CORAL if pct >= 80 else _AMBER if pct >= 60 else _GREEN
 
-def _ctx_code(tokens: float) -> str:
-    """Context window, by absolute tokens: green <120k, amber 120-160k, coral ≥160k."""
-    return (_CORAL if tokens >= CTX_CORAL_TOKENS
-            else _AMBER if tokens >= CTX_AMBER_TOKENS
+def _ctx_code(pct: float) -> str:
+    """Context: green <70%, amber 70-85%, coral ≥85% of the active model's window."""
+    return (_CORAL if pct >= CTX_CORAL_PCT
+            else _AMBER if pct >= CTX_AMBER_PCT
             else _GREEN)
 
 def _a(code: str, t: str) -> str:
@@ -96,8 +95,8 @@ def _a(code: str, t: str) -> str:
 def mono(t: str, pct: float) -> str:
     return _a(_code(pct), t)
 
-def ctxmono(t: str, tokens: float) -> str:
-    return _a(_ctx_code(tokens), t)
+def ctxmono(t: str, pct: float) -> str:
+    return _a(_ctx_code(pct), t)
 
 def label(t: str) -> str:
     return _a(_LABEL, t)
@@ -115,8 +114,8 @@ def _zc(code: str, t: str) -> str:
 def zmono(t: str, pct: float) -> str:
     return _zc(_code(pct), t)
 
-def zctx(t: str, tokens: float) -> str:
-    return _zc(_ctx_code(tokens), t)
+def zctx(t: str, pct: float) -> str:
+    return _zc(_ctx_code(pct), t)
 
 def zlabel(t: str) -> str:
     return _zc(_LABEL, t)
@@ -268,13 +267,13 @@ def render_statusline() -> None:
     model_d = d.get("model") or {}
     ws      = d.get("workspace") or {}
 
+    # Prefer Claude Code's own figure; fall back to tokens / this model's real
+    # window size (both live in the payload) so the % always reflects the
+    # active model's actual ceiling, not a fixed one.
     ctx_pct     = float(ctx_d.get("used_percentage") or 0)
-    cu          = ctx_d.get("current_usage") or {}
-    ctx_tokens  = (ctx_d.get("total_input_tokens")
-                   or (cu.get("input_tokens", 0)
-                       + cu.get("cache_creation_input_tokens", 0)
-                       + cu.get("cache_read_input_tokens", 0))
-                   or int(ctx_pct / 100 * CTX_LIMIT))  # last-resort estimate
+    if not ctx_pct:
+        win = ctx_d.get("context_window_size") or CTX_LIMIT
+        ctx_pct = 100.0 * (ctx_d.get("total_input_tokens") or 0) / win
     five_h      = rate.get("five_hour") or {}
     seven_d     = rate.get("seven_day") or {}
     five_h_pct  = float(five_h.get("used_percentage", 0)) if five_h else None
@@ -292,7 +291,6 @@ def render_statusline() -> None:
         "seven_d_pct":   seven_d_pct,
         "seven_d_reset": seven_d_rst,
         "ctx_pct":       ctx_pct,
-        "ctx_tokens":    int(ctx_tokens or 0),
         "cost_usd":      cost_usd,
         "model":         model_name,
         "source":        "stdin",
@@ -319,9 +317,10 @@ def render_statusline() -> None:
             seg += " " + label("↻" + fmt_reset(seven_d_rst, full=True))
         parts.append(seg)
 
-    # Group 3: ctx — number is % of window (room left), colour is by absolute tokens
+    # Group 3: ctx — % of the active model's context window; colour by proximity
+    # to auto-compact (green <70%, amber 70-85%, coral ≥85%)
     if ctx_pct > 2:
-        parts.append(label("ctx ") + _a(_ctx_code(ctx_tokens), f"{int(ctx_pct)}%"))
+        parts.append(label("ctx ") + _a(_ctx_code(ctx_pct), f"{int(ctx_pct)}%"))
 
     # Group 4: cost (≈ prefix signals API-equivalent, not real spend) + model + folder
     tail = ""
@@ -377,11 +376,10 @@ def render_bar(zsh: bool = True) -> None:
             seg += " " + lab("↻" + fmt_reset(seven_d_rst, full=True))
         parts.append(seg)
 
-    # ctx — number is % of window (room left), colour is by absolute tokens
+    # ctx — % of the active model's window; colour by proximity to auto-compact
     ctx_pct_c = c.get("ctx_pct")
-    ctx_tok_c = c.get("ctx_tokens") or int((ctx_pct_c or 0) / 100 * CTX_LIMIT)
     if ctx_pct_c and ctx_pct_c > 2:
-        parts.append(lab("ctx ") + ctxcol(f"{int(ctx_pct_c)}{PCT}", ctx_tok_c))
+        parts.append(lab("ctx ") + ctxcol(f"{int(ctx_pct_c)}{PCT}", ctx_pct_c))
 
     # cost (≈ = API-equivalent, not real spend) + model
     tail = ""

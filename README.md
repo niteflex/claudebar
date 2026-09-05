@@ -17,7 +17,7 @@ Two surfaces, one script:
 |---------|---------|
 | `████░░░░ 45% ↻23:45` | 5-hour rate limit — bar + usage % + local reset time |
 | `7d 63% ↻Apr 30 19:15` | 7-day rate limit + reset date and time |
-| `ctx 35%` | Share of the model's context window used — i.e. room left before Claude Code force-compacts |
+| `ctx 35%` | Share of the active model's context window used — room left before Claude Code force-compacts |
 | `≈$8.20` | API-equivalent cost this session (not actual billing for subscribers) |
 | `Opus 4.7` | Active model |
 | `~/my-project` | Current project folder |
@@ -34,20 +34,20 @@ Traffic-light palette — color appears only when you're approaching a limit. Wo
 | Amber | 60–80% |
 | Coral | ≥ 80% |
 
-**Context (`ctx`)** — by *absolute token count*, not percentage of the window:
+**Context (`ctx`)** — by percentage of the *active model's real context window*
+(Claude Code reports it live — 200K, 1M, whatever the current model has):
 
 | Color | Threshold |
 |-------|-----------|
-| Green | < 120K tokens |
-| Amber | 120K–160K tokens |
-| Coral | ≥ 160K tokens |
+| Green | < 70% |
+| Amber | 70–85% |
+| Coral | ≥ 85% |
 
-The number stays a percentage (how full the window is), but the color is driven by
-real tokens so it means the same thing whether you're on a 200K- or a 1M-context
-model. Anthropic publishes no "quality drops here" threshold; 120K/160K reproduces
-the old 60%/80%-of-200K calibration that practice settled on. On a 1M-context model
-the bar will look conservative — coral at ~16% of the window — by design. Adjust
-`CTX_AMBER_TOKENS` / `CTX_CORAL_TOKENS` at the top of `status.py` to taste.
+The denominator is the current model's own window, so the color adapts per model
+with no hardcoded ceiling. Auto-compact fires near the top of that window
+(~97–100%), so coral is your margin to wrap up or `/clear` on your own terms
+before Claude Code does it for you. Tune `CTX_AMBER_PCT` / `CTX_CORAL_PCT` at the
+top of `status.py`.
 
 ## Cost breakdown
 
@@ -123,19 +123,13 @@ over across `/clear`. The `≈$` figure always reflects the current session only
 `--cost` resets too, since it reads the same transcript.
 
 **Context climbs past 95% now; it used to turn red around 80%.**
-Two things changed, neither of them a bug:
-
-1. **The `ctx` color is now absolute-token based** (see [Colors](#colors)). Older
-   claudebar colored at 60%/80% of the window; on a 200K window that was 120K/160K
-   tokens, but on today's 1M-context models (Sonnet 5, Opus 5) the same 80% is 800K
-   tokens — far past where you'd actually want to compact. The new fixed thresholds
-   restore the old behavior in real terms.
-2. **Claude Code's auto-compact scales with the window.** It fires near the top of
-   whatever window the model has — roughly the full ~200K on a 200K model, ~967K on
-   a 1M model. So the raw percentage naturally sits higher before anything happens
-   on a big-window model. To force earlier auto-compaction, run `/autocompact 200k`
-   in Claude Code or set `CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000`. This is a Claude
-   Code setting; claudebar only reads the number.
+`ctx %` is now a percentage of the *active model's real context window*, which
+Claude Code reports live (200K on a 200K model, 1M on Sonnet 5 / Opus 5). The
+color turns amber at 70% and coral at 85% of that window — so it adapts to
+whichever model you're running, no fixed ceiling. Auto-compact itself fires near
+the top of the window (~97–100%) regardless of model. To make Claude Code compact
+earlier, run `/autocompact 200k` or set `CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000` —
+that's a Claude Code setting; claudebar only reads the number.
 
 **The bar shows stale numbers, or nothing at all.**
 It only appears in the terminal whose `CC_SESSION_ID` matches the running session,
