@@ -69,13 +69,25 @@ _EMPTY = "38;5;239"   # empty bar blocks — visible on black terminals
 
 RST = "\033[0m"
 
+# Context colour is driven by an ABSOLUTE token count, not % of the model's
+# context window. Anthropic publishes no quality-vs-context-fill threshold, and
+# auto-compact now fires only near the top of whatever window the model has
+# (~200K for 200K models, ~967K for 1M models) — so a window-relative % goes
+# red 5x later on a 1M model for the same real amount of context. These fixed
+# breakpoints (the old 60% / 80% of a 200K window) keep the colour meaning the
+# same regardless of which model is active. Change with care.
+CTX_AMBER_TOKENS = 120_000
+CTX_CORAL_TOKENS = 160_000
+
 def _code(pct: float) -> str:
     """Rate limits: green <60%, amber 60-80%, coral ≥80%."""
     return _CORAL if pct >= 80 else _AMBER if pct >= 60 else _GREEN
 
-def _ctx_code(pct: float) -> str:
-    """Context window: green <60%, amber 60-80%, coral ≥80%."""
-    return _CORAL if pct >= 80 else _AMBER if pct >= 60 else _GREEN
+def _ctx_code(tokens: float) -> str:
+    """Context window, by absolute tokens: green <120k, amber 120-160k, coral ≥160k."""
+    return (_CORAL if tokens >= CTX_CORAL_TOKENS
+            else _AMBER if tokens >= CTX_AMBER_TOKENS
+            else _GREEN)
 
 def _a(code: str, t: str) -> str:
     return f"\033[{code}m{t}{RST}"
@@ -84,8 +96,8 @@ def _a(code: str, t: str) -> str:
 def mono(t: str, pct: float) -> str:
     return _a(_code(pct), t)
 
-def ctxmono(t: str, pct: float) -> str:
-    return _a(_ctx_code(pct), t)
+def ctxmono(t: str, tokens: float) -> str:
+    return _a(_ctx_code(tokens), t)
 
 def label(t: str) -> str:
     return _a(_LABEL, t)
@@ -103,8 +115,8 @@ def _zc(code: str, t: str) -> str:
 def zmono(t: str, pct: float) -> str:
     return _zc(_code(pct), t)
 
-def zctx(t: str, pct: float) -> str:
-    return _zc(_ctx_code(pct), t)
+def zctx(t: str, tokens: float) -> str:
+    return _zc(_ctx_code(tokens), t)
 
 def zlabel(t: str) -> str:
     return _zc(_LABEL, t)
@@ -257,6 +269,12 @@ def render_statusline() -> None:
     ws      = d.get("workspace") or {}
 
     ctx_pct     = float(ctx_d.get("used_percentage") or 0)
+    cu          = ctx_d.get("current_usage") or {}
+    ctx_tokens  = (ctx_d.get("total_input_tokens")
+                   or (cu.get("input_tokens", 0)
+                       + cu.get("cache_creation_input_tokens", 0)
+                       + cu.get("cache_read_input_tokens", 0))
+                   or int(ctx_pct / 100 * CTX_LIMIT))  # last-resort estimate
     five_h      = rate.get("five_hour") or {}
     seven_d     = rate.get("seven_day") or {}
     five_h_pct  = float(five_h.get("used_percentage", 0)) if five_h else None
@@ -274,6 +292,7 @@ def render_statusline() -> None:
         "seven_d_pct":   seven_d_pct,
         "seven_d_reset": seven_d_rst,
         "ctx_pct":       ctx_pct,
+        "ctx_tokens":    int(ctx_tokens or 0),
         "cost_usd":      cost_usd,
         "model":         model_name,
         "source":        "stdin",
@@ -300,9 +319,9 @@ def render_statusline() -> None:
             seg += " " + label("↻" + fmt_reset(seven_d_rst, full=True))
         parts.append(seg)
 
-    # Group 3: ctx — color: green <60%, amber 60-80%, coral ≥80%
+    # Group 3: ctx — number is % of window (room left), colour is by absolute tokens
     if ctx_pct > 2:
-        parts.append(label("ctx ") + _a(_ctx_code(ctx_pct), f"{int(ctx_pct)}%"))
+        parts.append(label("ctx ") + _a(_ctx_code(ctx_tokens), f"{int(ctx_pct)}%"))
 
     # Group 4: cost (≈ prefix signals API-equivalent, not real spend) + model + folder
     tail = ""
@@ -358,10 +377,11 @@ def render_bar(zsh: bool = True) -> None:
             seg += " " + lab("↻" + fmt_reset(seven_d_rst, full=True))
         parts.append(seg)
 
-    # ctx — green <60%, amber 60-80%, coral ≥80%
+    # ctx — number is % of window (room left), colour is by absolute tokens
     ctx_pct_c = c.get("ctx_pct")
+    ctx_tok_c = c.get("ctx_tokens") or int((ctx_pct_c or 0) / 100 * CTX_LIMIT)
     if ctx_pct_c and ctx_pct_c > 2:
-        parts.append(lab("ctx ") + ctxcol(f"{int(ctx_pct_c)}{PCT}", ctx_pct_c))
+        parts.append(lab("ctx ") + ctxcol(f"{int(ctx_pct_c)}{PCT}", ctx_tok_c))
 
     # cost (≈ = API-equivalent, not real spend) + model
     tail = ""
@@ -373,9 +393,11 @@ def render_bar(zsh: bool = True) -> None:
     print("☁ " + DOT.join(parts), end="")
 
 # ── Render: --cost (manual, on-demand per-model breakdown) ────────────────────
-def _tally_transcript(path: Path) -> dict[str, dict[str, int]]:
-    """Sum token usage per model id across one session transcript."""
-    per_model: dict[str, dict[str, int]] = {}
+def _tally_transcript(path: Path, per_model: dict = None) -> dict:
+    """Sum token usage per model id across one transcript, accumulating into
+    per_model (a fresh dict when not supplied)."""
+    if per_model is None:
+        per_model = {}
     with open(path, errors="ignore") as f:
         for raw in f:
             raw = raw.strip()
@@ -421,14 +443,29 @@ def render_cost() -> None:
         return
 
     per_model = _tally_transcript(Path(tpath))
+
+    # Fold in every subagent this session spawned. Their transcripts sit in a
+    # directory named like the session id (transcript path minus ".jsonl"),
+    # under subagents/, and often use a different model than the main thread.
+    sub_dir = Path(tpath).with_suffix("") / "subagents"
+    n_subs = 0
+    if sub_dir.is_dir():
+        for sp in sorted(sub_dir.glob("*.jsonl")):
+            before = sum(sum(v.values()) for v in per_model.values())
+            _tally_transcript(sp, per_model)
+            if sum(sum(v.values()) for v in per_model.values()) != before:
+                n_subs += 1
+
     if not per_model:
         print(f"No assistant messages with usage data found in {tpath}")
         return
 
     rows, total, unpriced_tokens = [], 0.0, 0
     for mid, t in sorted(per_model.items()):
-        price = PRICING.get(mid)
         tok_total = t["input"] + t["output"] + t["cw5m"] + t["cw1h"] + t["read"]
+        if tok_total == 0:
+            continue  # e.g. <synthetic> messages carry no usage
+        price = PRICING.get(mid)
         if price:
             pin, pout, pcw, pread = price
             usd = (t["input"] * pin
@@ -445,7 +482,9 @@ def render_cost() -> None:
 
     W = (14, 12, 12, 14, 14, 12)
     head = ("model", "input", "output", "cache write", "cache read", "cost")
-    print(label("claudebar — session cost breakdown"))
+    print(label("claudebar — session cost breakdown"
+                + (f" (main conversation + {n_subs} subagent run"
+                   + ("s" if n_subs != 1 else "") + ")" if n_subs else "")))
     print(label(tpath))
     print()
     print(label(f"{head[0]:<{W[0]}}{head[1]:>{W[1]}}{head[2]:>{W[2]}}"
@@ -471,10 +510,10 @@ def render_cost() -> None:
     if unpriced_tokens:
         print(label(f"{unpriced_tokens:,} tokens belong to models missing from the "
                     "pricing table and are excluded from the total."))
-    subs = Path(tpath).with_suffix("") / "subagents"
-    if subs.is_dir():
-        print(label("Subagent transcripts exist for this session and are not "
-                    "included — this covers the main conversation only."))
+    if n_subs:
+        print(label(f"Includes {n_subs} subagent run"
+                    + ("s" if n_subs != 1 else "")
+                    + " spawned by this session."))
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main() -> None:
