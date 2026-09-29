@@ -6,10 +6,12 @@ Modes:
   --zsh          reads cache (populated by statusLine) → zsh RPROMPT string
   --bar          same bar in plain ANSI, for PowerShell / non-zsh prompts
   --cost         per-model $ breakdown for the current session (manual, on-demand)
+  --notify done|attention   Stop / Notification hook → macOS notification (click focuses the tab)
+  --focus ttysNNN           raise the Terminal.app tab running on that tty
   --update       refresh JSONL-based cache only, no output (background job)
 """
 
-import json, os, sys, time
+import json, os, re, subprocess, sys, time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -299,6 +301,9 @@ def render_statusline() -> None:
         "ts":            now,
     })
 
+    check_limit_alerts({"5h": (five_h_pct, five_h_rst), "7d": (seven_d_pct, seven_d_rst)},
+                       Path(cwd).name or "~")
+
     DOT   = label("  ·  ")
     SPACE = "  "
     parts: list[str] = []
@@ -514,6 +519,222 @@ def render_cost() -> None:
                     + " spawned by this session."))
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+# ── Notifications (macOS) ─────────────────────────────────────────────────────
+# `--notify done|attention` is called from Claude Code's Stop / Notification
+# hooks. "done" fires only when Claude has really stopped: it waits
+# NOTIFY_GRACE seconds and stays silent if the transcript grew meanwhile
+# (autonomous modes re-open the turn right after a Stop). Clicking a
+# notification runs `--focus <tty>`, which raises that Terminal.app tab.
+NOTIFY_GRACE   = 12    # s to wait after Stop before deciding the work is over
+NOTIFY_MIN_RUN = 20    # s — replies faster than this don't notify
+LIMIT_STEPS    = (80, 95, 100)   # % of a rate-limit window that raise an alert
+LIMIT_STATE    = Path("/tmp/.cc_limit_alerts.json")
+TERMINAL_NOTIFIER = next((p for p in ("/opt/homebrew/bin/terminal-notifier",
+                                      "/usr/local/bin/terminal-notifier")
+                          if os.path.exists(p)), None)
+LIMIT_RE = re.compile(r"(usage|rate|5-hour|weekly|session)\s+limit\s+(reached|hit)|limit reached", re.I)
+
+def _sh(*args: str) -> str:
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return ""
+
+def find_tty() -> str:
+    """tty of the terminal this process runs in (walks up to the `claude` process)."""
+    pid = os.getppid()
+    for _ in range(8):
+        tty = _sh("ps", "-o", "tty=", "-p", str(pid))
+        if tty and tty not in ("??", "?"):
+            return tty
+        pid = int(_sh("ps", "-o", "ppid=", "-p", str(pid)) or 0)
+        if pid <= 1:
+            break
+    return ""
+
+def project_name(cwd: str) -> str:
+    root = _sh("git", "-C", cwd, "rev-parse", "--show-toplevel") if cwd else ""
+    return Path(root or cwd or os.getcwd()).name or "~"
+
+def send_notification(title: str, message: str, sound: str, group: str,
+                      subtitle: str = "", tty: str = "") -> None:
+    if TERMINAL_NOTIFIER:
+        cmd = [TERMINAL_NOTIFIER, "-title", title, "-message", message,
+               "-sound", sound, "-group", group]
+        if subtitle:
+            cmd += ["-subtitle", subtitle]
+        if tty:
+            cmd += ["-execute", f"/usr/bin/python3 {Path(__file__).resolve()} --focus {tty}"]
+        subprocess.run(cmd, capture_output=True, timeout=10)
+    else:  # no click-to-focus without terminal-notifier
+        esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
+        subprocess.run(["osascript", "-e",
+            f'display notification "{esc(message)}" with title "{esc(title)}" '
+            f'subtitle "{esc(subtitle)}" sound name "{esc(sound)}"'],
+            capture_output=True, timeout=10)
+
+def focus_tty(tty: str) -> None:
+    dev = tty if tty.startswith("/dev/") else "/dev/" + tty
+    script = f'''
+tell application "Terminal"
+  repeat with w in windows
+    repeat with t in tabs of w
+      if tty of t is "{dev}" then
+        set selected of t to true
+        set index of w to 1
+        activate
+        return
+      end if
+    end repeat
+  end repeat
+  activate
+end tell'''
+    subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
+
+def _read_tail(path: str, size: int = 4_000_000) -> list:
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - size))
+            data = f.read().decode("utf-8", "ignore")
+        lines = data.splitlines()[1:] if len(data) >= size else data.splitlines()
+        out = []
+        for ln in lines:
+            try:
+                out.append(json.loads(ln))
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return []
+
+def _text_of(msg: dict) -> str:
+    c = (msg or {}).get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+def turn_summary(transcript: str) -> tuple:
+    """(seconds since the user's last real prompt or None, last assistant text)."""
+    entries = _read_tail(transcript)
+    last_text, started = "", None
+    for e in reversed(entries):
+        if not last_text and e.get("type") == "assistant":
+            last_text = _text_of(e.get("message")).strip()
+        if e.get("type") == "user" and not e.get("isSidechain") and _text_of(e.get("message")).strip():
+            try:
+                started = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00")).timestamp()
+            except Exception:
+                pass
+            break
+    return (time.time() - started if started else None), last_text
+
+def _size(p: str) -> int:
+    try:
+        return os.path.getsize(p)
+    except OSError:
+        return 0
+
+def fmt_dur(s: float) -> str:
+    s = int(s)
+    h, m = s // 3600, s % 3600 // 60
+    return f"{h} ч {m} мин" if h else (f"{m} мин" if m else f"{s} с")
+
+def notify_hook(kind: str) -> None:
+    try:
+        d = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        d = {}
+    tty = find_tty()
+    proj = project_name(d.get("cwd", ""))
+    tp = d.get("transcript_path") or ""
+    if kind == "attention":
+        if d.get("notification_type") == "idle_prompt":
+            return  # "done" already announced it
+        send_notification(f"Claude · {proj}", d.get("message") or "Ждёт вашего ответа",
+                          "Ping", f"claude-{tty or proj}", "Нужен ваш ввод", tty)
+        return
+    # done: detach so the hook returns at once, then decide after the grace period
+    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--notify-done",
+                      json.dumps({"tp": tp, "tty": tty, "proj": proj})],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+def notify_done_deferred(arg: str) -> None:
+    a = json.loads(arg)
+    tp, tty, proj = a["tp"], a["tty"], a["proj"]
+    dur, text = turn_summary(tp)
+    limit_hit = bool(LIMIT_RE.search(text))
+    if not limit_hit:
+        # Claude Code itself appends a few entries right after a Stop, so take
+        # the baseline a moment later and only then watch for real growth.
+        time.sleep(3)
+        size0 = _size(tp)
+        time.sleep(NOTIFY_GRACE - 3)
+        if _size(tp) > size0:
+            return  # Claude carried on — the work isn't finished
+        if dur is not None and dur < NOTIFY_MIN_RUN:
+            return
+    group = f"claude-{tty or proj}"
+    if limit_hit:
+        send_notification(f"Claude · {proj}", text[:160], "Basso", group, "Лимит исчерпан", tty)
+        schedule_reset_notice(proj, tty)
+        return
+    body = (text[:160] + "…") if len(text) > 160 else (text or "Задача завершена")
+    send_notification(f"Claude · {proj}", body, "Glass", group,
+                      "Готово" + (f" · {fmt_dur(dur)}" if dur else ""), tty)
+
+def schedule_reset_notice(proj: str, tty: str) -> None:
+    c = load_cache()
+    cands = [(c.get(k + "_pct") or 0, c.get(k + "_reset")) for k in ("five_h", "seven_d")]
+    resets = [r for p, r in sorted(cands, key=lambda x: -x[0]) if r and float(r) > time.time()]
+    if not resets:
+        return
+    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--notify-at",
+                      json.dumps({"at": float(resets[0]), "proj": proj, "tty": tty})],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+def notify_at(arg: str) -> None:
+    a = json.loads(arg)
+    while time.time() < a["at"]:
+        time.sleep(30)
+    send_notification(f"Claude · {a['proj']}", "Лимит сброшен — можно продолжать",
+                      "Hero", f"claude-{a['tty'] or a['proj']}", "", a["tty"])
+
+def check_limit_alerts(windows: dict, proj: str) -> None:
+    """Called from the statusLine. windows: {"5h": (pct, resets_at), "7d": (...)}."""
+    try:
+        state = json.loads(LIMIT_STATE.read_text()) if LIMIT_STATE.exists() else {}
+    except Exception:
+        state = {}
+    changed, tty = False, None
+    for name, (pct, rst) in windows.items():
+        if pct is None:
+            continue
+        st = state.get(name) or {}
+        if st.get("resets_at") != rst:
+            st = {"resets_at": rst, "step": 0}   # a fresh window starts over
+        step = max([s for s in LIMIT_STEPS if pct >= s], default=0)
+        if step > st.get("step", 0):
+            tty = tty if tty is not None else find_tty()
+            label_ = "5-часовой" if name == "5h" else "недельный"
+            send_notification(f"Claude · {proj}", f"{label_} лимит: {int(pct)}%"
+                              + (f", сброс в {fmt_reset(rst)}" if rst else ""),
+                              "Basso" if step >= 100 else "Sosumi", f"claude-limit-{name}",
+                              "Лимит", tty)
+            st["step"] = step
+        if state.get(name) != st:
+            state[name] = st
+            changed = True
+    if changed:
+        try:
+            LIMIT_STATE.write_text(json.dumps(state))
+        except Exception:
+            pass
+
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "--zsh"
     if mode == "--update":
@@ -522,6 +743,14 @@ def main() -> None:
         render_statusline()
     elif mode == "--cost":
         render_cost()
+    elif mode == "--notify":
+        notify_hook(sys.argv[2] if len(sys.argv) > 2 else "done")
+    elif mode == "--notify-done":
+        notify_done_deferred(sys.argv[2])
+    elif mode == "--notify-at":
+        notify_at(sys.argv[2])
+    elif mode == "--focus":
+        focus_tty(sys.argv[2])
     elif mode == "--bar":
         render_bar(zsh=False)   # plain ANSI — PowerShell and other non-zsh prompts
     else:

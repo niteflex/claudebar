@@ -140,3 +140,19 @@ left over from older versions.
 ## License
 
 MIT
+
+## Notifications (macOS)
+
+`status.py --notify done|attention` turns Claude Code's `Stop` / `Notification` hooks into Notification Center alerts titled `Claude · <repo folder>`.
+
+- **done** fires only when Claude has really stopped: it waits ~12 s and stays silent if the transcript keeps growing (autonomous modes). Replies under 20 s are skipped.
+- **attention** fires when Claude waits for a permission or an answer.
+- **limits**: the statusLine raises one alert per window at 80 / 95 / 100 % of the 5-hour and weekly limits, and a "limit reset" notice after a limit-reached stop.
+- Click a notification to raise the exact Terminal.app tab (`brew install terminal-notifier`; without it you still get alerts, but no click-to-focus).
+
+Hooks in `~/.claude/settings.json`:
+
+```json
+"Stop":         [{"hooks":[{"type":"command","command":"python3 \"$HOME/.claude/claudebar/status.py\" --notify done"}]}],
+"Notification": [{"hooks":[{"type":"command","command":"python3 \"$HOME/.claude/claudebar/status.py\" --notify attention"}]}]
+```
