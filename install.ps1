@@ -20,7 +20,12 @@ Write-Host 'Installing claudebar...'
 # 0. Locate Python. On Windows `python3` is frequently absent, so prefer whichever resolves.
 $PythonCmd = $null
 foreach ($candidate in 'python3', 'python') {
-    if (Get-Command $candidate -ErrorAction SilentlyContinue) { $PythonCmd = $candidate; break }
+    # Get-Command alone isn't enough: Windows ships a `python3.exe` Microsoft Store stub that
+    # exists on PATH but fails to run. Require it to actually execute.
+    if (Get-Command $candidate -ErrorAction SilentlyContinue) {
+        $ver = & $candidate --version 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0 -and $ver -match 'Python 3') { $PythonCmd = $candidate; break }
+    }
 }
 if (-not $PythonCmd) {
     Write-Host 'ERROR: no Python interpreter found on PATH.' -ForegroundColor Red

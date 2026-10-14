@@ -14,12 +14,21 @@ Modes:
 import json, os, re, subprocess, sys, time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+import tempfile
+
+IS_WIN = sys.platform == "win32"
+
+# Windows consoles/pipes default to a legacy codepage (cp1251, cp1252...); force
+# UTF-8 so block/arrow glyphs and Cyrillic don't raise UnicodeEncodeError.
+for _s in (sys.stdout, sys.stderr, sys.stdin):
+    try: _s.reconfigure(encoding="utf-8")
+    except Exception: pass
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 CLAUDE_DIR    = Path.home() / ".claude"
 PROJECTS_DIR  = CLAUDE_DIR / "projects"
 SETTINGS      = CLAUDE_DIR / "settings.json"
-CACHE         = Path("/tmp/.cc_status_cache.json")
+CACHE         = Path(tempfile.gettempdir()) / ".cc_status_cache.json"
 CACHE_TTL_SHOW = 600  # hide RPROMPT 10 min after last Claude response
 CACHE_TTL_COST = 1800 # --cost accepts a stdin cache up to 30 min old
 
@@ -103,6 +112,9 @@ def ctxmono(t: str, pct: float) -> str:
 def label(t: str) -> str:
     return _a(_LABEL, t)
 
+RESET_GLYPH = "↻ " if IS_WIN else "↻"   # ↻ (+space on Windows)
+CLOUD = "" if IS_WIN else "☁  "     # ☁ prefix, macOS only
+
 def mono_bar(pct: float, w: int = 8) -> str:
     n = round(w * min(max(pct, 0), 100) / 100)
     filled = _a(_code(pct), "█" * n) if n else ""
@@ -138,7 +150,7 @@ def fmt_reset(ts: float, full: bool = False) -> str:
         return "now"
     dt = datetime.fromtimestamp(ts)
     if full:
-        return dt.strftime("%b %-d %H:%M")  # Apr 30 07:11
+        return f"{dt:%b} {dt.day} {dt:%H:%M}"  # Apr 30 07:11
     return dt.strftime("%H:%M")             # 14:30
 
 def fmt_tok(n: int) -> str:
@@ -312,14 +324,14 @@ def render_statusline() -> None:
     if five_h_pct is not None:
         seg = mono_bar(five_h_pct) + " " + mono(f"{int(five_h_pct)}%", five_h_pct)
         if five_h_rst:
-            seg += " " + label("↻" + fmt_reset(five_h_rst))
+            seg += " " + label(RESET_GLYPH + fmt_reset(five_h_rst))
         parts.append(seg)
 
     # Group 2: 7-day — date if >24h away, clock time if ≤24h
     if seven_d_pct is not None:
         seg = label("7d ") + mono(f"{int(seven_d_pct)}%", seven_d_pct)
         if seven_d_rst:
-            seg += " " + label("↻" + fmt_reset(seven_d_rst, full=True))
+            seg += " " + label(RESET_GLYPH + fmt_reset(seven_d_rst, full=True))
         parts.append(seg)
 
     # Group 3: ctx — % of the active model's context window; colour by proximity
@@ -334,7 +346,7 @@ def render_statusline() -> None:
     tail += label(model_name) + SPACE + label(folder(cwd))
     parts.append(tail)
 
-    print("☁  " + DOT.join(parts), end="")
+    print(CLOUD + DOT.join(parts), end="")
 
 # ── Render: prompt bar (zsh RPROMPT / PowerShell prompt) ─────────────────────
 # Layout B compact: ██████░░ 68% ↻14:30  ·  7d 31% ↻Apr 30 07:11  ·  ctx 42%  ·  ≈$4.52  sonnet
@@ -371,14 +383,14 @@ def render_bar(zsh: bool = True) -> None:
     if five_h_pct is not None:
         seg = bar(five_h_pct) + " " + col(f"{int(five_h_pct)}{PCT}", five_h_pct)
         if five_h_rst:
-            seg += " " + lab("↻" + fmt_reset(five_h_rst))
+            seg += " " + lab(RESET_GLYPH + fmt_reset(five_h_rst))
         parts.append(seg)
 
     # 7d — date if >24h, clock time if ≤24h
     if seven_d_pct is not None:
         seg = lab("7d ") + col(f"{int(seven_d_pct)}{PCT}", seven_d_pct)
         if seven_d_rst:
-            seg += " " + lab("↻" + fmt_reset(seven_d_rst, full=True))
+            seg += " " + lab(RESET_GLYPH + fmt_reset(seven_d_rst, full=True))
         parts.append(seg)
 
     # ctx — % of the active model's window; colour by proximity to auto-compact
@@ -393,7 +405,7 @@ def render_bar(zsh: bool = True) -> None:
     tail += lab(model_name)
     parts.append(tail)
 
-    print("☁ " + DOT.join(parts), end="")
+    print(CLOUD.rstrip(" ") + (" " if CLOUD else "") + DOT.join(parts), end="")
 
 # ── Render: --cost (manual, on-demand per-model breakdown) ────────────────────
 def _tally_transcript(path: Path, per_model: dict = None) -> dict:
@@ -528,7 +540,7 @@ def render_cost() -> None:
 NOTIFY_GRACE   = 12    # s to wait after Stop before deciding the work is over
 NOTIFY_MIN_RUN = 20    # s — replies faster than this don't notify
 LIMIT_STEPS    = (80, 95, 100)   # % of a rate-limit window that raise an alert
-LIMIT_STATE    = Path("/tmp/.cc_limit_alerts.json")
+LIMIT_STATE    = Path(tempfile.gettempdir()) / ".cc_limit_alerts.json"
 TERMINAL_NOTIFIER = next((p for p in ("/opt/homebrew/bin/terminal-notifier",
                                       "/usr/local/bin/terminal-notifier")
                           if os.path.exists(p)), None)
@@ -558,6 +570,8 @@ def project_name(cwd: str) -> str:
 
 def send_notification(title: str, message: str, sound: str, group: str,
                       subtitle: str = "", tty: str = "") -> None:
+    if sys.platform != "darwin":
+        return
     if TERMINAL_NOTIFIER:
         cmd = [TERMINAL_NOTIFIER, "-title", title, "-message", message,
                "-sound", sound, "-group", group]
@@ -574,6 +588,8 @@ def send_notification(title: str, message: str, sound: str, group: str,
             capture_output=True, timeout=10)
 
 def focus_tty(tty: str) -> None:
+    if sys.platform != "darwin":
+        return
     dev = tty if tty.startswith("/dev/") else "/dev/" + tty
     script = f'''
 tell application "Terminal"
